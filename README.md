@@ -15,8 +15,10 @@ yum --enablerepo=elrepo-kernel install kernel-ml-devel -y
 
 Then do`egrep ^menuentry /etc/grub2.cfg | cut -f 2 -d \'`to see the sequence of alreadly installed kernels and choose the one you've installed just now.
 
+For instance, if you want choose the first one to boot by dedault then do 'grub2-set-default 0`. The sceond one, do`grub2-set-default 1`, so on and so forth.
+
 ```
-grub2-set-default 0  //For instance, if you want choose the first one to boot by dedault then do 'grub2-set-default 0`
+grub2-set-default 0 
 reboot
 ```
 
