@@ -30,7 +30,7 @@ scl enable devtoolset-4 bash
 - Download source code of tcp_bbr_modified and generate the Makefile
 
 ```
-https://github.com/GEM7/TCP_BBR_Modified.git
+wget https://raw.githubusercontent.com/GEM7/TCP_BBR_Modified/master/tcp_bbr_modified.c
 echo "obj-m:=tcp_bbr_Modified.o" > Makefile
 ```
 
