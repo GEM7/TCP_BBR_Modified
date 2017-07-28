@@ -1,6 +1,6 @@
 # TCP_BBR_Modified
 
-## How to compile tcp_bbr_modified algorithm on CentOS7?
+## How to compile tcp_bbr_modified algorithm on CentOS7
 
 - Install the latest version of Linux kernel, headers and devel tools.
 
@@ -29,6 +29,10 @@ yum -y install centos-release-scl
 yum -y install devtoolset-4-gcc*
 scl enable devtoolset-4 bash
 ```
+
+After installing GCC via scl, do`which gcc`to check if is was already installed correctly, it will return real path of GCC generally
+. Then do `gcc --version` to check the verion number, it would be 5.33.
+
 - Download source code of tcp_bbr_modified and generate the Makefile
 
 ```
@@ -42,7 +46,7 @@ echo "obj-m:=tcp_bbr_Modified.o" > Makefile
 make -s -C /lib/modules/$(uname -r)/build M=`pwd` modules CC=`which gcc`
 cp -rf ./tcp_bbr_modified.ko /lib/modules/$(uname -r)/kernel/net/ipv4
 depmod -a 
-odprobe tcp_bbr_modified
+modprobe tcp_bbr_modified
 ```
 
 - Set it as the default TCP congestion control algorithm
@@ -55,7 +59,7 @@ echo "net.ipv4.tcp_congestion_control = bbr_modified" >>/etc/sysctl.conf
 - Check if bbr_modified works
 
 ```
-lsmod | grrp bbr
+lsmod | grep bbr
 ```
 
 if you see words including bbr_modified, then it works.
