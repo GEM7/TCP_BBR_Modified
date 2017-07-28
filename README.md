@@ -13,9 +13,9 @@
   yum --enablerepo=elrepo-kernel install kernel-ml-devel -y
   ```
 
-Then do`egrep ^menuentry /etc/grub2.cfg | cut -f 2 -d \'`to see the sequence of alreadly installed kernels and choose the one you've installed just now.
+  Then do`egrep ^menuentry /etc/grub2.cfg | cut -f 2 -d \'`to see the sequence of alreadly installed kernels and choose the one you've installed just now.
 
-For instance, if you want choose the first one to boot by dedault then do 'grub2-set-default 0`. The sceond one, do`grub2-set-default 1`, so on and so forth.
+  For instance, if you want choose the first one to boot by dedault then do 'grub2-set-default 0`. The sceond one, do`grub2-set-default 1`, so on and so forth.
 
   ```
   grub2-set-default 0 
@@ -30,7 +30,7 @@ For instance, if you want choose the first one to boot by dedault then do 'grub2
   scl enable devtoolset-4 bash
   ```
 
-After installing GCC via scl, do`which gcc`to check if is was already installed correctly, it will return real path of GCC generally
+  After installing GCC via scl, do`which gcc`to check if is was already installed correctly, it will return real path of GCC generally
 . Then do `gcc --version` to check the verion number, it would be 5.33.
 
 - Download source code of tcp_bbr_modified and generate the Makefile
@@ -62,4 +62,4 @@ After installing GCC via scl, do`which gcc`to check if is was already installed 
   lsmod | grep bbr
   ```
 
-if you see words including bbr_modified, then it works.
+  if you see words including bbr_modified, then it works.
