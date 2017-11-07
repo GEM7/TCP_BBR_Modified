@@ -1,5 +1,4 @@
-/* Bottleneck Bandwidth and RTT (BBR) congestion control
- *
+/*
  * BBR congestion control computes the sending rate based on the delivery
  * rate (throughput) estimated from ACKs. In a nutshell:
  *
@@ -14,6 +13,36 @@
  * observed, or adjust the sending rate if it estimates there is a
  * traffic policer, in order to keep the drop rate reasonable.
  *
+ * Here is a state transition diagram for BBR:
+ *
+ *             |
+ *             V
+ *    +---> STARTUP  ----+
+ *    |        |         |
+ *    |        V         |
+ *    |      DRAIN   ----+
+ *    |        |         |
+ *    |        V         |
+ *    +---> PROBE_BW ----+
+ *    |      ^    |      |
+ *    |      |    |      |
+ *    |      +----+      |
+ *    |                  |
+ *    +---- PROBE_RTT <--+
+ *
+ * A BBR flow starts in STARTUP, and ramps up its sending rate quickly.
+ * When it estimates the pipe is full, it enters DRAIN to drain the queue.
+ * In steady state a BBR flow only uses PROBE_BW and PROBE_RTT.
+ * A long-lived BBR flow spends the vast majority of its time remaining
+ * (repeatedly) in PROBE_BW, fully probing and utilizing the pipe's bandwidth
+ * in a fair manner, with a small, bounded queue. *If* a flow has been
+ * continuously sending for the entire min_rtt window, and hasn't seen an RTT
+ * sample that matches or decreases its min_rtt estimate for 10 seconds, then
+ * it briefly enters PROBE_RTT to cut inflight to a minimum value to re-probe
+ * the path's two-way propagation delay (min_rtt). When exiting PROBE_RTT, if
+ * we estimated that we reached the full bw of the pipe then we enter PROBE_BW;
+ * otherwise we enter STARTUP to try to fill the pipe.
+ *
  * BBR is described in detail in:
  *   "BBR: Congestion-Based Congestion Control",
  *   Neal Cardwell, Yuchung Cheng, C. Stephen Gunn, Soheil Hassas Yeganeh,
@@ -22,10 +51,9 @@
  * There is a public e-mail list for discussing BBR development and testing:
  *   https://groups.google.com/forum/#!forum/bbr-dev
  *
- * NOTE: BBR *must* be used with the fq qdisc ("man tc-fq") with pacing enabled,
- * since pacing is integral to the BBR design and implementation.
- * BBR without pacing would not function properly, and may incur unnecessary
- * high packet loss rates.
+ * NOTE: BBR might be used with the fq qdisc ("man tc-fq") with pacing enabled,
+ * otherwise TCP stack falls back to an internal pacing using one high
+ * resolution timer per TCP socket and may use more resources.
  */
 #include <linux/module.h>
 #include <net/tcp.h>
@@ -51,20 +79,18 @@ enum bbr_mode {
 	BBR_STARTUP,	/* ramp up sending rate rapidly to fill pipe */
 	BBR_DRAIN,	/* drain any queue created during startup */
 	BBR_PROBE_BW,	/* discover, share bw: pace around estimated bw */
-	BBR_PROBE_RTT,	/* cut cwnd to min to probe min_rtt */
+	BBR_PROBE_RTT,	/* cut inflight to min to probe min_rtt */
 };
 
 /* BBR congestion control block */
 struct bbr {
 	u32	min_rtt_us;	        /* min RTT in min_rtt_win_sec window */
-//deprecated	u32	rtt_us;
 	u32	min_rtt_stamp;	        /* timestamp of min_rtt_us */
 	u32	probe_rtt_done_stamp;   /* end time for BBR_PROBE_RTT mode */
-//deprecated	struct minmax max_rtt;
 	struct minmax bw;	/* Max recent delivery rate in pkts/uS << 24 */
 	u32	rtt_cnt;	    /* count of packet-timed rounds elapsed */
 	u32     next_rtt_delivered; /* scb->tx.delivered at end of round */
-	struct skb_mstamp cycle_mstamp;  /* time of this cycle phase start */
+	u64	cycle_mstamp;	     /* time of this cycle phase start */
 	u32     mode:3,		     /* current bbr_mode in state machine */
 		prev_ca_state:3,     /* CA state on previous ACK */
 		packet_conservation:1,  /* use packet conservation? */
@@ -85,7 +111,8 @@ struct bbr {
 		cwnd_gain:10,	/* current gain for setting cwnd */
 		full_bw_cnt:3,	/* number of rounds without large bw gains */
 		cycle_idx:3,	/* current index in pacing_gain cycle array */
-		unused_b:6;
+		has_seen_rtt:1, /* have we seen an RTT sample yet? */
+		unused_b:5;
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
 };
@@ -95,30 +122,30 @@ struct bbr {
 /* Window length of bw filter (in rounds): */
 static const int bbr_bw_rtts = CYCLE_LEN + 7;
 /* Window length of min_rtt filter (in sec): */
-static const u32 bbr_min_rtt_win_sec = 20;
+static const u32 bbr_min_rtt_win_sec = 5;
 /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
-static const u32 bbr_probe_rtt_mode_ms = 200;
+static const u32 bbr_probe_rtt_mode_ms = 100;
 /* Skip TSO below the following bandwidth (bits/sec): */
-static const int bbr_min_tso_rate = 1200000;
+static const int bbr_min_tso_rate = 1400000;
 
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
  * that will allow a smoothly increasing pacing rate that will double each RTT
  * and send the same number of packets per RTT that an un-paced, slow-starting
  * Reno or CUBIC flow would:
  */
-static const int bbr_high_gain  = BBR_UNIT * 2885 / 1000 + 1;
+static const int bbr_high_gain  = BBR_UNIT * 3000 / 1000 + 1;
 /* The pacing gain of 1/high_gain in BBR_DRAIN is calculated to typically drain
  * the queue created in BBR_STARTUP in a single round:
  */
-static const int bbr_drain_gain = BBR_UNIT * 1200 / 2885;
+static const int bbr_drain_gain = BBR_UNIT * 1000 / 3000;
 /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
 static const int bbr_cwnd_gain  = BBR_UNIT * 2;
 /* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
 static const int bbr_pacing_gain[] = {
-	BBR_UNIT * 3 / 2,	/* probe for more available bw */
+	BBR_UNIT * 5 / 4,	/* probe for more available bw */
 	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
-	BBR_UNIT * 9 / 8, BBR_UNIT * 9 / 8, BBR_UNIT * 9 / 8,	/* cruise at 1.0*bw to utilize pipe, */
-	BBR_UNIT * 9 / 8, BBR_UNIT * 9 / 8, BBR_UNIT * 9 / 8	/* without creating excess queue... */
+	BBR_UNIT * 4 / 3, BBR_UNIT * 4 / 3, BBR_UNIT * 4 / 3,	/* cruise at 1.0*bw to utilize pipe, */
+	BBR_UNIT * 4 / 3, BBR_UNIT * 4 / 3, BBR_UNIT * 4 / 3	/* without creating excess queue... */
 };
 /* Randomize the starting gain cycling phase over N phases: */
 static const u32 bbr_cycle_rand = 7;
@@ -131,7 +158,7 @@ static const u32 bbr_cwnd_min_target = 4;
 
 /* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
 /* If bw has increased significantly (1.25x), there may be more bw available: */
-static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
+static const u32 bbr_full_bw_thresh = BBR_UNIT * 4 / 3;
 /* But after 3 rounds w/o significant bw growth, estimate pipe is full: */
 static const u32 bbr_full_bw_cnt = 3;
 
@@ -145,7 +172,7 @@ static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
 /* If 2 intervals have a bw diff <= 4 Kbit/sec their bw is "consistent": */
 static const u32 bbr_lt_bw_diff = 4000 / 8;
 /* If we estimate we're policed, use lt_bw for this many round trips: */
-static const u32 bbr_lt_bw_max_rtts = 48;
+static const u32 bbr_lt_bw_max_rtts = 40;
 
 /* Do we estimate that STARTUP filled the pipe? */
 static bool bbr_full_bw_reached(const struct sock *sk)
@@ -184,6 +211,35 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 	return rate >> BW_SCALE;
 }
 
+/* Convert a BBR bw and gain factor to a pacing rate in bytes per second. */
+static u32 bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
+{
+	u64 rate = bw;
+
+	rate = bbr_rate_bytes_per_sec(sk, rate, gain);
+	rate = min_t(u64, rate, sk->sk_max_pacing_rate);
+	return rate;
+}
+
+/* Initialize pacing rate to: high_gain * init_cwnd / RTT. */
+static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	struct bbr *bbr = inet_csk_ca(sk);
+	u64 bw;
+	u32 rtt_us;
+
+	if (tp->srtt_us) {		/* any RTT sample yet? */
+		rtt_us = max(tp->srtt_us >> 3, 1U);
+		bbr->has_seen_rtt = 1;
+	} else {			 /* no RTT sample yet */
+		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT */
+	}
+	bw = (u64)tp->snd_cwnd * BW_UNIT;
+	do_div(bw, rtt_us);
+	sk->sk_pacing_rate = bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain);
+}
+
 /* Pace using current bw estimate and a gain factor. In order to help drive the
  * network toward lower queues while maintaining high utilization and low
  * latency, the average pacing rate aims to be slightly (~1%) lower than the
@@ -193,12 +249,13 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
  */
 static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-	u64 rate = bw;
+	u32 rate = bbr_bw_to_pacing_rate(sk, bw, gain);
 
-	rate = bbr_rate_bytes_per_sec(sk, rate, gain);
-	rate = min_t(u64, rate, sk->sk_max_pacing_rate);
-	if (bbr->mode != BBR_STARTUP || rate > sk->sk_pacing_rate)
+	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
+		bbr_init_pacing_rate_from_rtt(sk);
+	if (bbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate)
 		sk->sk_pacing_rate = rate;
 }
 
@@ -374,7 +431,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 done:
 	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);	/* apply global cap */
 	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
-		tp->snd_cwnd = max(tp->snd_cwnd >> 1, bbr_cwnd_min_target);
+		tp->snd_cwnd = min(tp->snd_cwnd, bbr_cwnd_min_target);
 }
 
 /* End cycle phase if it's time and/or we hit the phase's in-flight target. */
@@ -384,7 +441,7 @@ static bool bbr_is_next_cycle_phase(struct sock *sk,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 	bool is_full_length =
-		skb_mstamp_us_delta(&tp->delivered_mstamp, &bbr->cycle_mstamp) >
+		tcp_stamp_us_delta(tp->delivered_mstamp, bbr->cycle_mstamp) >
 		bbr->min_rtt_us;
 	u32 inflight, bw;
 
@@ -470,7 +527,7 @@ static void bbr_reset_lt_bw_sampling_interval(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	bbr->lt_last_stamp = tp->delivered_mstamp.stamp_jiffies;
+	bbr->lt_last_stamp = div_u64(tp->delivered_mstamp, USEC_PER_MSEC);
 	bbr->lt_last_delivered = tp->delivered;
 	bbr->lt_last_lost = tp->lost;
 	bbr->lt_rtt_cnt = 0;
@@ -524,7 +581,7 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 lost, delivered;
 	u64 bw;
-	s32 t;
+	u32 t;
 
 	if (bbr->lt_use_bw) {	/* already using long-term rate, lt_bw? */
 		if (bbr->mode == BBR_PROBE_BW && bbr->round_start &&
@@ -576,15 +633,15 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 		return;
 
 	/* Find average delivery rate in this sampling interval. */
-	t = (s32)(tp->delivered_mstamp.stamp_jiffies - bbr->lt_last_stamp);
-	if (t < 1)
-		return;		/* interval is less than one jiffy, so wait */
-	t = jiffies_to_usecs(t);
-	/* Interval long enough for jiffies_to_usecs() to return a bogus 0? */
-	if (t < 1) {
+	t = div_u64(tp->delivered_mstamp, USEC_PER_MSEC) - bbr->lt_last_stamp;
+	if ((s32)t < 1)
+		return;		/* interval is less than one ms, so wait */
+	/* Check if can multiply without overflow */
+	if (t >= ~0U / USEC_PER_MSEC) {
 		bbr_reset_lt_bw_sampling(sk);  /* interval too long; reset */
 		return;
 	}
+	t *= USEC_PER_MSEC;
 	bw = (u64)delivered * BW_UNIT;
 	do_div(bw, t);
 	bbr_lt_bw_interval_done(sk, bw);
@@ -700,23 +757,16 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-//deprecated	u32 rtt_prior = 0;
 	bool filter_expired;
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
-	filter_expired = after(tcp_time_stamp,
+	filter_expired = after(tcp_jiffies32,
 			       bbr->min_rtt_stamp + bbr_min_rtt_win_sec * HZ);
 	if (rs->rtt_us >= 0 &&
 	    (rs->rtt_us <= bbr->min_rtt_us || filter_expired)) {
 		bbr->min_rtt_us = rs->rtt_us;
-		bbr->min_rtt_stamp = tcp_time_stamp;
-//deprecated		bbr->rtt_us = rs->rtt_us;
+		bbr->min_rtt_stamp = tcp_jiffies32;
 	}
-//deprecated	bbr->rtt_us = rs->rtt_us;
-//deprecated	rtt_prior = minmax_get(&bbr->max_rtt);
-//deprecated	bbr->rtt_us = min(bbr->rtt_us, rtt_prior);
-  
-//deprecated	minmax_running_max(&bbr->max_rtt, bbr_bw_rtts, bbr->rtt_cnt, rs->rtt_us);
 
 	if (bbr_probe_rtt_mode_ms > 0 && filter_expired &&
 	    !bbr->idle_restart && bbr->mode != BBR_PROBE_RTT) {
@@ -734,16 +784,16 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 		/* Maintain min packets in flight for max(200 ms, 1 round). */
 		if (!bbr->probe_rtt_done_stamp &&
 		    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
-			bbr->probe_rtt_done_stamp = tcp_time_stamp +
-				msecs_to_jiffies(bbr_probe_rtt_mode_ms >> 1);
+			bbr->probe_rtt_done_stamp = tcp_jiffies32 +
+				msecs_to_jiffies(bbr_probe_rtt_mode_ms);
 			bbr->probe_rtt_round_done = 0;
 			bbr->next_rtt_delivered = tp->delivered;
 		} else if (bbr->probe_rtt_done_stamp) {
 			if (bbr->round_start)
 				bbr->probe_rtt_round_done = 1;
 			if (bbr->probe_rtt_round_done &&
-			    after(tcp_time_stamp, bbr->probe_rtt_done_stamp)) {
-				bbr->min_rtt_stamp = tcp_time_stamp;
+			    after(tcp_jiffies32, bbr->probe_rtt_done_stamp)) {
+				bbr->min_rtt_stamp = tcp_jiffies32;
 				bbr->restore_cwnd = 1;  /* snap to prior_cwnd */
 				bbr_reset_mode(sk);
 			}
@@ -778,7 +828,6 @@ static void bbr_init(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-	u64 bw;
 
 	bbr->prior_cwnd = 0;
 	bbr->tso_segs_goal = 0;	 /* default segs per skb until first ACK */
@@ -790,25 +839,24 @@ static void bbr_init(struct sock *sk)
 	bbr->probe_rtt_done_stamp = 0;
 	bbr->probe_rtt_round_done = 0;
 	bbr->min_rtt_us = tcp_min_rtt(tp);
-	bbr->min_rtt_stamp = tcp_time_stamp;
+	bbr->min_rtt_stamp = tcp_jiffies32;
 
 	minmax_reset(&bbr->bw, bbr->rtt_cnt, 0);  /* init max bw to 0 */
 
-	/* Initialize pacing rate to: high_gain * init_cwnd / RTT. */
-	bw = (u64)tp->snd_cwnd * BW_UNIT;
-	do_div(bw, (tp->srtt_us >> 3) ? : USEC_PER_MSEC);
-	sk->sk_pacing_rate = 0;		/* force an update of sk_pacing_rate */
-	bbr_set_pacing_rate(sk, bw, bbr_high_gain);
+	bbr->has_seen_rtt = 0;
+	bbr_init_pacing_rate_from_rtt(sk);
 
 	bbr->restore_cwnd = 0;
 	bbr->round_start = 0;
 	bbr->idle_restart = 0;
 	bbr->full_bw = 0;
 	bbr->full_bw_cnt = 0;
-	bbr->cycle_mstamp.v64 = 0;
+	bbr->cycle_mstamp = 0;
 	bbr->cycle_idx = 0;
 	bbr_reset_lt_bw_sampling(sk);
 	bbr_reset_startup_mode(sk);
+
+	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
 static u32 bbr_sndbuf_expand(struct sock *sk)
@@ -869,18 +917,18 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
 }
 
 static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
-	.flags		= TCP_CONG_NON_RESTRICTED,
-	.name		= "bbr_modified",
-	.owner		= THIS_MODULE,
-	.init		= bbr_init,
+	.flags			= TCP_CONG_NON_RESTRICTED,
+	.name			= "bbr_modified",
+	.owner			= THIS_MODULE,
+	.init			= bbr_init,
 	.cong_control	= bbr_main,
 	.sndbuf_expand	= bbr_sndbuf_expand,
-	.undo_cwnd	= bbr_undo_cwnd,
-	.cwnd_event	= bbr_cwnd_event,
-	.ssthresh	= bbr_ssthresh,
+	.undo_cwnd		= bbr_undo_cwnd,
+	.cwnd_event		= bbr_cwnd_event,
+	.ssthresh		= bbr_ssthresh,
 	.tso_segs_goal	= bbr_tso_segs_goal,
-	.get_info	= bbr_get_info,
-	.set_state	= bbr_set_state,
+	.get_info		= bbr_get_info,
+	.set_state		= bbr_set_state,
 };
 
 static int __init bbr_register(void)
@@ -901,5 +949,6 @@ MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
 MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
 MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
 MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
+MODULE_AUTHOR("Nanqinlang <https://sometimesnaive.org>");														 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
